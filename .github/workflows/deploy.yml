@@ -1,0 +1,120 @@
+name: Deploy (GitHub Pages + Cloudflare Pages)
+
+# main에 push하면 두 공유 주소를 같은 커밋으로 함께 갱신한다.
+#   GitHub Pages     https://hyegeungim3-git.github.io/qdata/  (base /qdata/)
+#   Cloudflare Pages https://qdata-bn3.pages.dev/                  (base /)
+# 검사(lint·계약 검사)는 build 잡에서 한 번만 돌고, 통과해야 두 배포가 시작된다.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Validate domain packs
+        run: npm run check:domains
+      - name: Validate demo storage contract
+        run: npm run check:storage
+      - name: Build (GitHub Pages, base /qdata/)
+        run: npm run build
+      # Cloudflare는 루트에서 서빙하므로 base가 달라 번들을 따로 만든다(같은 소스·같은 커밋)
+      - name: Build (Cloudflare Pages, base /)
+        run: npm run build -- --outDir dist-cf
+        env:
+          VITE_BASE: /
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloudflare-dist
+          path: dist-cf
+          retention-days: 3
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  deploy-cloudflare:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # 토큰은 저장소 시크릿, 계정 ID는 저장소 변수(비밀 아님)로 둔다.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      # 토큰이 없으면 GitHub Pages 배포는 그대로 두고 이 잡만 건너뛴다.
+      # 조용히 넘어가지 않도록 경고 주석과 잡 요약에 이유를 남긴다.
+      - name: Check Cloudflare credentials
+        if: env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == ''
+        run: |
+          echo "::warning title=Cloudflare 배포 건너뜀::CLOUDFLARE_API_TOKEN 시크릿 또는 CLOUDFLARE_ACCOUNT_ID 변수가 없어 qdata-bn3.pages.dev를 갱신하지 않았습니다."
+          echo "### ⚠️ Cloudflare 배포 건너뜀" >> "$GITHUB_STEP_SUMMARY"
+          echo "저장소 시크릿 \`CLOUDFLARE_API_TOKEN\`(또는 변수 \`CLOUDFLARE_ACCOUNT_ID\`)이 없어 https://qdata-bn3.pages.dev/ 를 갱신하지 않았습니다." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/download-artifact@v4
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        with:
+          name: cloudflare-dist
+          path: dist-cf
+      - uses: actions/setup-node@v4
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        with:
+          node-version: 22
+      # 프로젝트는 이미 클래식 Pages로 존재한다 — pages deploy는 --force 없이 동작한다(로컬에서 확인한 버전으로 고정)
+      - name: Deploy to Cloudflare Pages
+        id: cf
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ env.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: "4.135.0"
+          command: pages deploy dist-cf --project-name=qdata --branch=main --commit-hash=${{ github.sha }}
+      # 배포 판정: 이번 배포 주소와 운영 주소가 200이고 앱 제목이 실제로 서빙되는가
+      - name: Verify Cloudflare deployment
+        if: env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != ''
+        env:
+          DEPLOY_URL: ${{ steps.cf.outputs.deployment-url }}
+        run: |
+          for url in "$DEPLOY_URL" "https://qdata-bn3.pages.dev/"; do
+            [ -z "$url" ] && continue
+            for i in 1 2 3 4 5 6; do
+              code=$(curl -s -o page.html -w "%{http_code}" "$url")
+              if [ "$code" = "200" ] && grep -q "QData" page.html; then echo "OK $url"; break; fi
+              echo "재시도 $i: $url → $code"; sleep 10
+            done
+            [ "$code" = "200" ] && grep -q "QData" page.html || { echo "::error::$url 검증 실패 ($code)"; exit 1; }
+          done
+          echo "### ✅ Cloudflare 배포 완료" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 이번 배포: $DEPLOY_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 운영 주소: https://qdata-bn3.pages.dev/" >> "$GITHUB_STEP_SUMMARY"
