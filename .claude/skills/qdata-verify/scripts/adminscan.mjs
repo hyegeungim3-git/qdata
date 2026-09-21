@@ -67,9 +67,16 @@ for (const dom of targets) {
 
   for (const menu of menus) {
     await page.goto(`${BASE}/#/${dom}/admin/${menu}`, { waitUntil: "networkidle2" });
-    await sleep(900);   // 마커 판정이 렌더 타이밍에 흔들리지 않게 — 700ms에서 간헐 오탐을 봤다
-    const txt = await page.evaluate(() => (document.querySelector("main") || document.body).innerText);
-    const missing = (markerMap.get(menu) || []).filter(m => !txt.includes(m));
+    /* 해시 전환 직후엔 이전 화면이 잠깐 남아 있을 수 있다 — 한 번 읽고 '누락'이라 단정하면
+       멀쩡한 화면이 FAIL로 나온다(실제로 겪음). 마커가 다 보일 때까지 최대 약 3초 다시 읽는다. */
+    const want = markerMap.get(menu) || [];
+    let txt = "";
+    for (let i = 0; i < 6; i++) {
+      await sleep(i ? 450 : 700);
+      txt = await page.evaluate(() => (document.querySelector("main") || document.body).innerText);
+      if (want.every(m => txt.includes(m))) break;
+    }
+    const missing = want.filter(m => !txt.includes(m));
     const leak = banned.filter(w => txt.includes(w));
     results.push({ menu, missing, leak });
   }
@@ -79,7 +86,7 @@ for (const dom of targets) {
   const fails = results.filter(r => r.missing.length || r.leak.length);
   totalFail += fails.length + consoleErrors.length;
 
-  console.log(`\n[${fails.length || consoleErrors.length ? "FAIL" : "PASS"}] ${dom} — 관리자 ${ADMIN_PAGES[dom].length}페이지`);
+  console.log(`\n[${fails.length || consoleErrors.length ? "FAIL" : "PASS"}] ${dom} — 전 메뉴 ${results.length}개 누수 스캔 (마커 검사 ${ADMIN_PAGES[dom].length}개)`);
   for (const r of results) {
     const bad = r.missing.length || r.leak.length;
     if (!bad) continue;

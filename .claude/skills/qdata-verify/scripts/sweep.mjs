@@ -82,10 +82,23 @@ export async function sweepScreen(page, url, {
     clicked++;
     await sleep(settleMs);
 
-    const state = await page.evaluate(() => {
+    /* 흰 화면 판정은 '지속'될 때만 — 전환 도중의 순간 상태(리마운트·지연 렌더)를 잡으면
+       멀쩡한 화면이 FAIL로 나온다(실제로 겪음: 알림 클릭·사이드바 접기가 0자로 오판).
+       클릭이 페이지 이동을 일으켜 컨텍스트가 사라지면 이동으로 보고 복귀한다. */
+    const measure = () => page.evaluate(() => {
       const m = document.querySelector("main");
       return { len: m ? m.innerText.trim().length : 0, hash: location.hash };
     });
+    let state;
+    try {
+      state = await measure();
+      if (state.len < blankBelow) { await sleep(600); state = await measure(); }
+    } catch (e) {
+      if (!/Execution context was destroyed|Target closed/.test(String(e))) throw e;
+      await page.goto(url, { waitUntil: "networkidle2" });
+      await sleep(400);
+      continue;
+    }
     const name = btn.replace(/^\|/, "") || "(아이콘 버튼)";
     for (const e of errs.slice(before)) findings.push(`${label} · "${name}" → ${e.slice(0, 110)}`);
     if (state.len < blankBelow) findings.push(`${label} · "${name}" → 화면이 비었음(본문 ${state.len}자)`);
